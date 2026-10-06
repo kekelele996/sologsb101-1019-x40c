@@ -5,11 +5,12 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Brush, Document, Files, Reading, Tools } from '@element-plus/icons-vue'
+import { Brush, Camera, Document, Files, Reading, Tools } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useImagingStore } from '@/stores/imagingStore'
 import { initDatabase } from '@/utils/db'
 import { useLeafStats } from '@/hooks/useLeafStats'
 
@@ -18,13 +19,20 @@ const router = useRouter()
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const imagingStore = useImagingStore()
 const { totals } = useLeafStats()
 const ready = ref(false)
 
 onMounted(async () => {
   try {
     await initDatabase()
-    await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+    await Promise.all([
+      bookStore.loadBooks(),
+      bookStore.loadVolumes(),
+      leafStore.loadLeaves(),
+      repairStore.loadOrders(),
+      imagingStore.loadAll()
+    ])
   } catch (error) {
     ElMessage.error(`本地数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}`)
   } finally {
@@ -45,6 +53,13 @@ const navItems = computed(() => {
     },
     { path: '/papers', label: '补纸选配', icon: Brush, badge: '', disabled: false },
     { path: '/repairs', label: '修复工序', icon: Tools, badge: String(repairStore.totalSteps), disabled: false },
+    {
+      path: '/imaging',
+      label: '修后影像',
+      icon: Camera,
+      badge: String(imagingStore.queuedCount + imagingStore.scanningCount),
+      disabled: false
+    },
     { path: '/export', label: '装订归档', icon: Files, badge: '', disabled: false }
   ]
 })
@@ -67,7 +82,7 @@ function go(path: string, disabled: boolean): void {
         <span class="app-header__mark">修</span>
         <div>
           <h1 class="app-header__title">古籍修复工序与补纸配色档案</h1>
-          <p class="app-header__sub">gbbookrestore · 古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订</p>
+          <p class="app-header__sub">gbbookrestore · 古籍 → 册次 → 书叶 → 补纸 / 工序 / 影像 / 装订</p>
         </div>
       </div>
       <nav class="app-nav">

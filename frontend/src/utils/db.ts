@@ -1,23 +1,26 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Paper 增加 dyeRecipe 字段并按纸种回填默认配方）
- * - 六张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑（v1 → v2：Paper 增加 dyeRecipe 字段并按纸种回填默认配方；
+ *   v2 → v3：新增修后影像两表 scanShifts / scanTasks，并按已扫册次补录历史影像）
+ * - 八张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
-import Dexie, { type Table } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
 import type { Book } from '@/types/book'
 import type { Volume } from '@/types/volume'
 import type { Leaf } from '@/types/leaf'
 import { DEFAULT_DYE_RECIPE, type Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import { LEGACY_SHIFT_ID, type ScanShift } from '@/types/scanShift'
+import type { ScanTask } from '@/types/scanTask'
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbbookrestore'
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -88,6 +91,8 @@ export class BookRestoreDatabase extends Dexie {
   papers!: Table<Paper, string>
   repairOrders!: Table<RepairOrder, string>
   bindings!: Table<Binding, string>
+  scanShifts!: Table<ScanShift, string>
+  scanTasks!: Table<ScanTask, string>
 
   constructor() {
     super(DB_NAME)
@@ -101,7 +106,7 @@ export class BookRestoreDatabase extends Dexie {
       bindings: 'id, volumeId, verdict, finishDate, updatedAt'
     })
     // v2：Paper 增加 dyeRecipe 字段，按纸种为历史记录回填默认配方
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         books: 'id, title, era, level, collectionNo, updatedAt',
         volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
@@ -122,6 +127,22 @@ export class BookRestoreDatabase extends Dexie {
             if (typeof paper.thicknessMm !== 'number') paper.thicknessMm = 0.06
           })
       })
+    // v3：修后影像存档 —— 新增台班与册次影像任务两表；
+    // 升级时按已扫册次补录历史影像，缺册号的只读待认领
+    this.version(DB_VERSION)
+      .stores({
+        books: 'id, title, era, level, collectionNo, updatedAt',
+        volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
+        leaves: 'id, volumeId, leafNo, damageType, phValue, state, updatedAt',
+        papers: 'id, leafId, paperType, laidPattern, deltaE, updatedAt',
+        repairOrders: 'id, leafId, seq, name, operator, state, updatedAt',
+        bindings: 'id, volumeId, method, verdict, finishDate, updatedAt',
+        scanShifts: 'id, date, scanner, operator, updatedAt',
+        scanTasks: 'id, shiftId, volumeId, state, retakeOf, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await backfillLegacyImaging(tx)
+      })
   }
 }
 
@@ -131,6 +152,80 @@ export const db = new BookRestoreDatabase()
 export function createId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8)
   return `${prefix}_${Date.now().toString(36)}${rand}`
+}
+
+/**
+ * v3 升级迁移：旧数据里在修的册没有影像归属，
+ * 按已扫的册次（已装订 / 已归档 / 有装订记录）补一批历史影像记录；
+ * 悬空装订记录对应的影像缺册号，只读留着等人认领。
+ */
+async function backfillLegacyImaging(tx: Transaction): Promise<void> {
+  const now = Date.now()
+  const volumes = await tx.table<Volume, string>('volumes').toArray()
+  const bindings = await tx.table<Binding, string>('bindings').toArray()
+  const legacyShift: ScanShift = {
+    id: LEGACY_SHIFT_ID,
+    date: new Date(now).toISOString().slice(0, 10),
+    scanner: '历史补录（非扫描仪）',
+    operator: '系统迁移',
+    capacity: 0,
+    note: '升级时按已扫册次补录的历史影像；缺册号记录只读，等人认领',
+    createdAt: now,
+    updatedAt: now
+  }
+  await tx.table('scanShifts').put(legacyShift)
+
+  const volumeIds = new Set(volumes.map((volume) => volume.id))
+  const scannedIds = new Set<string>()
+  volumes
+    .filter((volume) => volume.state === 'bound' || volume.state === 'archived')
+    .forEach((volume) => scannedIds.add(volume.id))
+  // 装订过的册影像必然齐过（影像不齐不能进装订），一并补录
+  bindings.forEach((binding) => {
+    if (volumeIds.has(binding.volumeId)) scannedIds.add(binding.volumeId)
+  })
+
+  const rows: ScanTask[] = []
+  scannedIds.forEach((volumeId) => {
+    const volume = volumes.find((item) => item.id === volumeId)
+    if (!volume) return
+    rows.push({
+      id: `task_legacy_${volumeId}`,
+      shiftId: LEGACY_SHIFT_ID,
+      volumeId,
+      volumeLabel: '',
+      expectedCount: volume.leafCount * 2,
+      imageCount: volume.leafCount * 2,
+      state: 'done',
+      defectCount: 0,
+      defectReason: '',
+      retakeOf: null,
+      origin: 'legacy',
+      createdAt: now,
+      updatedAt: now
+    })
+  })
+  // 册次已删的悬空装订记录：补一条缺册号的只读历史影像，等人认领
+  bindings
+    .filter((binding) => !volumeIds.has(binding.volumeId))
+    .forEach((binding) => {
+      rows.push({
+        id: `task_orphan_${binding.id}`,
+        shiftId: LEGACY_SHIFT_ID,
+        volumeId: null,
+        volumeLabel: `旧档影像（原册号 ${binding.volumeId} 缺失）`,
+        expectedCount: 0,
+        imageCount: 0,
+        state: 'done',
+        defectCount: 0,
+        defectReason: '',
+        retakeOf: null,
+        origin: 'legacy',
+        createdAt: now,
+        updatedAt: now
+      })
+    })
+  if (rows.length > 0) await tx.table('scanTasks').bulkPut(rows)
 }
 
 /** 打开数据库并在首次使用时播种演示数据（幂等） */
@@ -230,9 +325,21 @@ export async function seedDatabase(): Promise<void> {
     { id: 'bind_0101', volumeId: 'vol_0101', method: '四眼线装', finishDate: '2026-03-10', verdict: 'rework', inspector: '程砚', createdAt: now - day * 2, updatedAt: now - day * 2 }
   ]
 
+  const scanShifts: ScanShift[] = [
+    { id: LEGACY_SHIFT_ID, date: '2026-02-10', scanner: '历史补录（非扫描仪）', operator: '系统迁移', capacity: 0, note: '升级时按已扫册次补录的历史影像；缺册号记录只读，等人认领', createdAt: now - day * 55, updatedAt: now - day * 55 },
+    { id: 'shift_01', date: new Date(now).toISOString().slice(0, 10), scanner: '赛数 OS15000', operator: '季岚', capacity: 2, note: '上午班', createdAt: now - day * 1, updatedAt: now - day * 1 }
+  ]
+
+  const scanTasks: ScanTask[] = [
+    { id: 'task_0101', shiftId: LEGACY_SHIFT_ID, volumeId: 'vol_0101', volumeLabel: '', expectedCount: 48, imageCount: 48, state: 'done', defectCount: 0, defectReason: '', retakeOf: null, origin: 'legacy', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'task_0201', shiftId: LEGACY_SHIFT_ID, volumeId: 'vol_0201', volumeLabel: '', expectedCount: 60, imageCount: 60, state: 'done', defectCount: 0, defectReason: '', retakeOf: null, origin: 'legacy', createdAt: now - day * 26, updatedAt: now - day * 26 },
+    { id: 'task_0301', shiftId: LEGACY_SHIFT_ID, volumeId: 'vol_0301', volumeLabel: '', expectedCount: 24, imageCount: 24, state: 'done', defectCount: 0, defectReason: '', retakeOf: null, origin: 'legacy', createdAt: now - day * 50, updatedAt: now - day * 50 },
+    { id: 'task_orphan_01', shiftId: LEGACY_SHIFT_ID, volumeId: null, volumeLabel: '旧影像袋·无册号（约 30 张）', expectedCount: 0, imageCount: 30, state: 'done', defectCount: 0, defectReason: '', retakeOf: null, origin: 'legacy', createdAt: now - day * 45, updatedAt: now - day * 45 }
+  ]
+
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.scanShifts, db.scanTasks],
     async () => {
       await db.books.bulkPut(books)
       await db.volumes.bulkPut(volumes)
@@ -240,6 +347,8 @@ export async function seedDatabase(): Promise<void> {
       await db.papers.bulkPut(papers)
       await db.repairOrders.bulkPut(repairOrders)
       await db.bindings.bulkPut(bindings)
+      await db.scanShifts.bulkPut(scanShifts)
+      await db.scanTasks.bulkPut(scanTasks)
     }
   )
 }
@@ -256,16 +365,21 @@ export interface RestoreSnapshot {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  /** v3 新增；导入 v2 备份时允许缺省，按空集合处理 */
+  scanShifts?: ScanShift[]
+  scanTasks?: ScanTask[]
 }
 
 export async function exportSnapshot(): Promise<RestoreSnapshot> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
+  const [books, volumes, leaves, papers, repairOrders, bindings, scanShifts, scanTasks] = await Promise.all([
     db.books.toArray(),
     db.volumes.toArray(),
     db.leaves.toArray(),
     db.papers.toArray(),
     db.repairOrders.toArray(),
-    db.bindings.toArray()
+    db.bindings.toArray(),
+    db.scanShifts.toArray(),
+    db.scanTasks.toArray()
   ])
   return {
     app: DB_NAME,
@@ -276,7 +390,9 @@ export async function exportSnapshot(): Promise<RestoreSnapshot> {
     leaves,
     papers,
     repairOrders,
-    bindings
+    bindings,
+    scanShifts,
+    scanTasks
   }
 }
 
@@ -296,13 +412,22 @@ export function validateSnapshot(input: unknown): string {
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`
   }
+  // v3 新增集合：旧版备份允许缺失，存在时必须是数组
+  const optionalKeys: Array<keyof RestoreSnapshot> = ['scanShifts', 'scanTasks']
+  for (const key of optionalKeys) {
+    if (snapshot[key] !== undefined && !Array.isArray(snapshot[key])) {
+      return `备份文件 ${String(key)} 集合格式不正确`
+    }
+  }
   return ''
 }
 
 export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
+  const scanShifts = snapshot.scanShifts ?? []
+  const scanTasks = snapshot.scanTasks ?? []
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.scanShifts, db.scanTasks],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -310,7 +435,9 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.scanShifts.clear(),
+        db.scanTasks.clear()
       ])
       await db.books.bulkPut(snapshot.books)
       await db.volumes.bulkPut(snapshot.volumes)
@@ -318,6 +445,8 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
       await db.papers.bulkPut(snapshot.papers)
       await db.repairOrders.bulkPut(snapshot.repairOrders)
       await db.bindings.bulkPut(snapshot.bindings)
+      await db.scanShifts.bulkPut(scanShifts)
+      await db.scanTasks.bulkPut(scanTasks)
     }
   )
 }
@@ -325,7 +454,7 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.scanShifts, db.scanTasks],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -333,7 +462,9 @@ export async function clearAllTables(): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.scanShifts.clear(),
+        db.scanTasks.clear()
       ])
     }
   )
@@ -345,18 +476,20 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
+  const [books, volumes, leaves, papers, repairOrders, bindings, scanShifts, scanTasks] = await Promise.all([
     db.books.count(),
     db.volumes.count(),
     db.leaves.count(),
     db.papers.count(),
     db.repairOrders.count(),
-    db.bindings.count()
+    db.bindings.count(),
+    db.scanShifts.count(),
+    db.scanTasks.count()
   ])
-  return { books, volumes, leaves, papers, repairOrders, bindings }
+  return { books, volumes, leaves, papers, repairOrders, bindings, scanShifts, scanTasks }
 }
 
-/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 / 影像任务 */
 export async function removeBookCascade(bookId: string): Promise<void> {
   const volumeIds = (await db.volumes.where('bookId').equals(bookId).toArray()).map((row) => row.id)
   const leafIds = volumeIds.length
@@ -364,7 +497,7 @@ export async function removeBookCascade(bookId: string): Promise<void> {
     : []
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.scanTasks],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
@@ -373,6 +506,7 @@ export async function removeBookCascade(bookId: string): Promise<void> {
       if (volumeIds.length > 0) {
         await db.leaves.where('volumeId').anyOf(volumeIds).delete()
         await db.bindings.where('volumeId').anyOf(volumeIds).delete()
+        await db.scanTasks.where('volumeId').anyOf(volumeIds).delete()
       }
       await db.volumes.where('bookId').equals(bookId).delete()
       await db.books.delete(bookId)
@@ -380,12 +514,12 @@ export async function removeBookCascade(bookId: string): Promise<void> {
   )
 }
 
-/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 / 影像任务 */
 export async function removeVolumeCascade(volumeId: string): Promise<void> {
   const leafIds = (await db.leaves.where('volumeId').equals(volumeId).toArray()).map((row) => row.id)
   await db.transaction(
     'rw',
-    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.scanTasks],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
@@ -393,6 +527,7 @@ export async function removeVolumeCascade(volumeId: string): Promise<void> {
       }
       await db.leaves.where('volumeId').equals(volumeId).delete()
       await db.bindings.where('volumeId').equals(volumeId).delete()
+      await db.scanTasks.where('volumeId').equals(volumeId).delete()
       await db.volumes.delete(volumeId)
     }
   )

@@ -2,6 +2,7 @@
 /**
  * /export 装订还原与验收归档
  * 登记装订方式与验收结论，验收合格触发全册归档；支持 JSON 结构版本导入导出。
+ * 一册的修后影像齐了（影像室扫完且漏扫拍糊已补）才放它进装订。
  * 消费 Binding 及全部模型；复用 <StatBadge>、<EmptyPanel>、<DamageTag>。
  */
 import { computed, reactive, ref } from 'vue'
@@ -14,6 +15,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useImagingStore } from '@/stores/imagingStore'
 import {
   BINDING_METHOD_OPTIONS,
   BINDING_VERDICT_COLOR,
@@ -48,6 +50,7 @@ import {
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const imagingStore = useImagingStore()
 const { totals } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
@@ -57,11 +60,15 @@ const lastBackupAt = ref<string | null>(readLastBackupAt())
 
 const volumeOptions = computed(() =>
   bookStore.books.flatMap((book) =>
-    bookStore.volumesOfBook(book.id).map((volume) => ({
-      value: volume.id,
-      label: `《${book.title}》第 ${volume.volumeNo} 册 · ${BINDING_TYPE_LABEL[volume.bindingType]} · ${VOLUME_STATE_LABEL[volume.state]}`,
-      locked: isVolumeLocked(volume.state)
-    }))
+    bookStore.volumesOfBook(book.id).map((volume) => {
+      const imagingReady = imagingStore.imagingReadyOf(volume.id)
+      return {
+        value: volume.id,
+        label: `《${book.title}》第 ${volume.volumeNo} 册 · ${BINDING_TYPE_LABEL[volume.bindingType]} · ${VOLUME_STATE_LABEL[volume.state]} · 影像${imagingReady ? '已齐' : '未齐'}`,
+        locked: isVolumeLocked(volume.state),
+        imagingReady
+      }
+    })
   )
 )
 
@@ -93,7 +100,8 @@ const context = computed(() => ({
   leaves: leafStore.leaves,
   papers: paperTable.rows.value,
   repairOrders: repairStore.orders,
-  bindings: bindingTable.rows.value
+  bindings: bindingTable.rows.value,
+  scanTasks: imagingStore.tasks
 }))
 
 const archiveText = computed(() => buildArchiveReport(context.value))
@@ -102,6 +110,11 @@ const archiveText = computed(() => buildArchiveReport(context.value))
 const dialog = ref(false)
 const editing = ref<Binding | null>(null)
 const form = reactive<BindingDraft>(createEmptyBindingDraft(''))
+
+/** 当前所选册次的修后影像是否齐（齐了修复室才放进装订） */
+const selectedImagingReady = computed(() =>
+  form.volumeId ? imagingStore.imagingReadyOf(form.volumeId) : true
+)
 
 function openCreate(): void {
   const first = volumeOptions.value[0]
@@ -129,6 +142,11 @@ function openEdit(binding: Binding): void {
 async function submit(): Promise<void> {
   if (!form.volumeId) {
     ElMessage.warning('请选择册次')
+    return
+  }
+  // 影像门禁：一册的修后影像齐了才放它进装订（编辑历史验收记录不拦）
+  if (!editing.value && !imagingStore.imagingReadyOf(form.volumeId)) {
+    ElMessage.warning('该册修后影像未齐（影像室未扫完，或漏扫拍糊未补），暂不能进装订；请先在「修后影像」台班处理')
     return
   }
   if (editing.value) {
@@ -208,7 +226,13 @@ async function handleFile(event: Event): Promise<void> {
     return
   }
   await importSnapshot(parsed as RestoreSnapshot)
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    imagingStore.loadAll()
+  ])
   ElMessage.success('导入完成，数据已覆盖')
 }
 
@@ -223,7 +247,13 @@ async function handleReset(): Promise<void> {
     return
   }
   await resetDatabase()
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    imagingStore.loadAll()
+  ])
   ElMessage.success('已清空并重新载入演示数据')
 }
 
@@ -328,7 +358,7 @@ function verdictColor(verdict: string): string {
         <el-card shadow="never" style="margin-top: 16px">
           <template #header>整库导出</template>
           <p class="gb-muted">
-            导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+            导出文件包含 8 张业务表全量数据（含修后影像台班与册次影像任务）与结构版本号，可在其他设备通过「导入 JSON」还原。
           </p>
           <div class="gb-toolbar">
             <el-button :icon="Download" @click="handleExport">JSON 备份</el-button>
@@ -370,6 +400,15 @@ function verdictColor(verdict: string): string {
           <el-input v-model="form.inspector" placeholder="如：程砚" />
         </el-form-item>
       </el-form>
+      <el-alert
+        v-if="!editing && form.volumeId && !selectedImagingReady"
+        type="warning"
+        show-icon
+        :closable="false"
+        style="margin-bottom: 10px"
+        title="该册修后影像未齐，不能登记装订"
+        description="请先在「修后影像」台班确认影像室已扫完，且漏扫拍糊已补出。"
+      />
       <el-alert
         v-if="form.verdict === 'pass'"
         type="success"

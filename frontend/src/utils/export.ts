@@ -8,6 +8,7 @@ import type { Leaf } from '@/types/leaf'
 import type { Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import { isVolumeImagingReady, type ScanTask } from '@/types/scanTask'
 import { BOOK_LEVEL_LABEL } from '@/types/book'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL } from '@/types/volume'
 import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
@@ -55,6 +56,7 @@ export interface ExportContext {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  scanTasks: ScanTask[]
 }
 
 /** 验收归档清单文本：按古籍 → 册次 → 书叶 → 工序展开 */
@@ -71,11 +73,22 @@ export function buildArchiveReport(context: ExportContext): string {
     volumes.forEach((volume) => {
       const leaves = context.leaves.filter((leaf) => leaf.volumeId === volume.id)
       const binding = context.bindings.find((item) => item.volumeId === volume.id)
+      const imagingTasks = context.scanTasks.filter((task) => task.volumeId === volume.id)
+      const imagingProduced = imagingTasks
+        .filter((task) => task.state === 'done')
+        .reduce((sum, task) => sum + task.imageCount, 0)
       const totalArea = Math.round(leaves.reduce((sum, leaf) => sum + leaf.damageAreaCm2, 0) * 10) / 10
       const averagePh =
         leaves.length === 0 ? 0 : Math.round((leaves.reduce((sum, leaf) => sum + leaf.phValue, 0) / leaves.length) * 100) / 100
       lines.push(
         `   第 ${volume.volumeNo} 册　${BINDING_TYPE_LABEL[volume.bindingType]}　${VOLUME_STATE_LABEL[volume.state]}　叶数 ${volume.leafCount}　破损 ${totalArea} cm²　平均 pH ${averagePh}`
+      )
+      lines.push(
+        `      修后影像：${
+          imagingTasks.length === 0
+            ? '影像室未登记'
+            : `${isVolumeImagingReady(imagingTasks) ? '已齐' : '未齐'}　已出 ${imagingProduced} 张`
+        }`
       )
       lines.push(
         `      装订验收：${
