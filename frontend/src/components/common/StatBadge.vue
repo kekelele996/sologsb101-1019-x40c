@@ -6,11 +6,16 @@
  */
 import { computed, type Component } from 'vue'
 import {
+  Calendar,
+  Camera,
+  Clock,
   DataLine,
   Files,
   Histogram,
   Odometer,
+  Picture,
   PieChart,
+  QuestionFilled,
   TrendCharts,
   WarningFilled
 } from '@element-plus/icons-vue'
@@ -54,7 +59,12 @@ const iconMap: Record<string, Component> = {
   Odometer,
   PieChart,
   TrendCharts,
-  WarningFilled
+  WarningFilled,
+  Calendar,
+  Camera,
+  Clock,
+  Picture,
+  QuestionFilled
 }
 
 const iconComponent = computed<Component>(() => iconMap[props.icon] ?? DataLine)

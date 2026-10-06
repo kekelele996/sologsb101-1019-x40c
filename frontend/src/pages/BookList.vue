@@ -16,6 +16,9 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useScanStore } from '@/stores/scanStore'
+import { imageStatusOf } from '@/hooks/useImageCompleteness'
+import ImageStatusTag from '@/components/common/ImageStatusTag.vue'
 import {
   BOOK_LEVEL_COLOR,
   BOOK_LEVEL_LABEL,
@@ -42,8 +45,17 @@ const router = useRouter()
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const scanStore = useScanStore()
 const { statOf } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
+
+/** 一册修后影像齐套情况（修复室只认册次/书叶） */
+function imagingOf(volumeId: string) {
+  const volume = bookStore.volumeById(volumeId)
+  const status = imageStatusOf(volume, scanStore.imagesOfVolume(volumeId))
+  const hasJob = scanStore.jobs.some((job) => job.volumeId === volumeId)
+  return { ...status, hasJob }
+}
 
 const FILTER_KEYS = ['era', 'level'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -420,6 +432,17 @@ function bindingLabel(value: string): string {
         <el-table-column label="破损 / 工序" min-width="140">
           <template #default="{ row }">
             {{ statOf(row.id).recordCount }} 条 / {{ statOf(row.id).orderDoneCount }}·{{ statOf(row.id).orderCount }}
+          </template>
+        </el-table-column>
+        <el-table-column label="修后影像" min-width="150">
+          <template #default="{ row }">
+            <ImageStatusTag
+              size="small"
+              :leaf-count="row.leafCount"
+              :covered-leaves="imagingOf(row.id).coveredLeaves"
+              :retake-count="imagingOf(row.id).retakeCount"
+              :has-job="imagingOf(row.id).hasJob"
+            />
           </template>
         </el-table-column>
         <el-table-column label="操作" width="240">

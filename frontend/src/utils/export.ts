@@ -14,6 +14,12 @@ import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
 import { PAPER_TYPE_LABEL, deltaELevel } from '@/types/paper'
 import { REPAIR_NAME_LABEL } from '@/types/repairOrder'
 import { BINDING_VERDICT_LABEL } from '@/types/binding'
+import type { Scanner } from '@/types/scanner'
+import type { ScanShift } from '@/types/scanShift'
+import type { ScanJob } from '@/types/scanJob'
+import type { ImageRecord } from '@/types/imageRecord'
+import { SHIFT_SLOT_LABEL } from '@/types/scanShift'
+import { SCAN_JOB_STATE_LABEL } from '@/types/scanJob'
 import type { RestoreSnapshot } from './db'
 
 /** 触发浏览器下载 */
@@ -55,6 +61,32 @@ export interface ExportContext {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  scanners: Scanner[]
+  scanShifts: ScanShift[]
+  scanJobs: ScanJob[]
+  imageRecords: ImageRecord[]
+}
+
+/** 一册修后影像齐套情况（每叶一张合格影像才算齐） */
+export function volumeImagingSummary(
+  volume: Volume,
+  jobs: ScanJob[],
+  images: ImageRecord[]
+): { complete: boolean; okCount: number; retakeCount: number; latestJob?: ScanJob } {
+  const inVolume = images.filter((image) => image.volumeId === volume.id && image.state !== 'missing')
+  const okLeaves = new Set(
+    images.filter((image) => image.volumeId === volume.id && image.state === 'ok').map((image) => image.leafNo)
+  )
+  const complete = volume.leafCount > 0 && okLeaves.size >= volume.leafCount
+  const latestJob = jobs
+    .filter((job) => job.volumeId === volume.id)
+    .sort((a, b) => b.createdAt - a.createdAt)[0]
+  return {
+    complete,
+    okCount: inVolume.filter((image) => image.state === 'ok').length,
+    retakeCount: inVolume.filter((image) => image.state === 'retake').length,
+    latestJob
+  }
 }
 
 /** 验收归档清单文本：按古籍 → 册次 → 书叶 → 工序展开 */
@@ -82,6 +114,24 @@ export function buildArchiveReport(context: ExportContext): string {
           binding
             ? `${binding.method}　${binding.finishDate}　${BINDING_VERDICT_LABEL[binding.verdict]}　验收人 ${binding.inspector || '未填写'}`
             : '尚未装订'
+        }`
+      )
+      const imaging = volumeImagingSummary(volume, context.scanJobs, context.imageRecords)
+      const imagingShift = imaging.latestJob
+        ? context.scanShifts.find((shift) => shift.id === imaging.latestJob?.shiftId)
+        : undefined
+      const scanner = imagingShift ? context.scanners.find((item) => item.id === imagingShift.scannerId) : undefined
+      lines.push(
+        `      修后影像：${
+          imaging.latestJob
+            ? `${imaging.complete ? '影像齐' : '影像未齐'}　合格 ${imaging.okCount} 张${
+                imaging.retakeCount > 0 ? `　待重拍 ${imaging.retakeCount} 张` : ''
+              }　${SCAN_JOB_STATE_LABEL[imaging.latestJob.state]}${
+                imagingShift
+                  ? `　${imagingShift.workDate}${SHIFT_SLOT_LABEL[imagingShift.slot]}${scanner ? ` · ${scanner.code}` : ''}`
+                  : ''
+              }`
+            : '尚未送影像室扫描'
         }`
       )
       leaves.forEach((leaf) => {
